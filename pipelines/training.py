@@ -37,6 +37,10 @@ configure_logging()
         "tensorflow",
         "boto3",
         "mlflow",
+        "psutil",
+        "pynvml",
+        "metaflow",
+        "seaborn"
     ),
 )
 class Training(FlowSpec, DatasetMixin):
@@ -49,7 +53,7 @@ class Training(FlowSpec, DatasetMixin):
     mlflow_tracking_uri = Parameter(
         "mlflow-tracking-uri",
         help="Location of the MLflow tracking server.",
-        default=os.getenv("MLFLOW_TRACKING_URI", "https://127.0.0.1:5000"),
+        default=os.getenv("MLFLOW_TRACKING_URI", "http://127.0.0.1:5000"),
     )
 
     training_epochs = Parameter(
@@ -98,7 +102,7 @@ class Training(FlowSpec, DatasetMixin):
         # to evaluate the model and train a final model on the entire dataset. Since
         # these two steps are independent, we can run them in parallel.
         self.next(self.cross_validation, self.transform)
-
+    
     @card
     @step
     def cross_validation(self):
@@ -177,6 +181,7 @@ class Training(FlowSpec, DatasetMixin):
             mlflow.start_run(
                 run_name=f"cross-validation-fold-{self.fold}",
                 nested=True,
+                log_system_metrics=True,
             ) as run,
         ):
             # Let's store the identifier of the nested run in an artifact so we can
@@ -208,7 +213,7 @@ class Training(FlowSpec, DatasetMixin):
         # After training a model for this fold, we want to evaluate it.
         self.next(self.evaluate_fold)
 
-    @card
+    @card(type='blank')
     @environment(
         vars={
             "KERAS_BACKEND": os.getenv("KERAS_BACKEND", "tensorflow"),
@@ -222,7 +227,9 @@ class Training(FlowSpec, DatasetMixin):
         the model using the test data associated with the current fold.
         """
         import mlflow
-
+        import numpy as np
+        from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+        import matplotlib.pyplot as plt
         logging.info("Evaluating fold %d...", self.fold)
         mlflow.set_tracking_uri(self.mlflow_tracking_uri)
 
@@ -232,7 +239,25 @@ class Training(FlowSpec, DatasetMixin):
             self.y_test,
             verbose=0,
         )
-
+        y_test = np.concatenate(self.y_test)
+        predictions = self.model.predict(self.x_test).argmax(axis=1)
+        # Let's compute the confusion matrix for the current fold.
+        self.confusion_matrix = confusion_matrix(
+            y_test,
+            predictions,
+        )
+        fig, ax = plt.subplots()
+        disp = ConfusionMatrixDisplay(confusion_matrix=self.confusion_matrix, display_labels=['Adelie', 'Chinstrap', 'Gentoo'])
+        plt.title(f'Confusion Matrix - Fold {self.fold}')
+        plt.xlabel('Predicted')
+        plt.ylabel('True')
+        disp.plot(ax=ax, cmap='Blues')
+        # Save the plot to a temporary file
+        plt.savefig('confusion_matrix.png')
+        with mlflow.start_run(run_id=self.mlflow_fold_run_id):
+            mlflow.log_figure(fig, 'confusion_matrix.png')
+        
+        logging.info("Confusion matrix for fold %d:\n%s", self.fold, self.confusion_matrix)
         logging.info(
             "Fold %d - test_loss: %f - test_accuracy: %f",
             self.fold,
