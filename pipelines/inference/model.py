@@ -96,14 +96,44 @@ class Model(mlflow.pyfunc.PythonModel):
             "samples" if len(model_input) > 1 else "sample",
         )
 
+        # Process individual samples to handle per-sample errors
         model_output = []
+        valid_samples_df = pd.DataFrame()
+        valid_indices = []
 
-        transformed_payload = self.process_input(model_input)
-        if transformed_payload is not None:
-            logging.info("Making a prediction using the transformed payload...")
-            predictions = self.model.predict(transformed_payload, verbose=0)
+        # First pass: identify which samples can be processed
+        for i, (_, sample) in enumerate(model_input.iterrows()):
+            try:
+                sample_df = pd.DataFrame([sample.to_dict()])
+                # Test if the sample can be transformed
+                self.features_transformer.transform(sample_df)
+                # If no exception, add to valid samples
+                valid_samples_df = pd.concat([valid_samples_df, sample_df], ignore_index=True)
+                valid_indices.append(i)
+            except Exception as e:
+                logging.warning(f"Sample at index {i} could not be processed: {str(e)}")
 
-            model_output = self.process_output(predictions)
+        # Process valid samples if any exist
+        if not valid_samples_df.empty:
+            transformed_payload = self.process_input(valid_samples_df)
+            if transformed_payload is not None:
+                predictions = self.model.predict(transformed_payload, verbose=0)
+                valid_outputs = self.process_output(predictions)
+                
+                # Map predictions back to the original input order
+                for input_idx in range(len(model_input)):
+                    if input_idx in valid_indices:
+                        # Find position in valid_indices
+                        valid_idx = valid_indices.index(input_idx)
+                        model_output.append(valid_outputs[valid_idx])
+                    else:
+                        # Skip this sample in the output
+                        pass
+            else:
+                # If transformation failed for the whole batch
+                logging.warning("Transformation failed for all valid samples.")
+        else:
+            logging.warning("No valid samples to process.")
 
         if self.backend is not None:
             self.backend.save(model_input, model_output)
