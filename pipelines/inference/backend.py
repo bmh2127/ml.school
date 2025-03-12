@@ -192,6 +192,7 @@ class Local(Backend):
         return data
 
     def save(self, model_input: pd.DataFrame, model_output: list):
+        # Formerly `capture`
         """Save production data to a SQLite database.
 
         If the database doesn't exist, this function will create it.
@@ -230,6 +231,9 @@ class Local(Backend):
             data["uuid"] = [str(uuid.uuid4()) for _ in range(len(data))]
 
             # Finally, we can save the data to the database.
+            # Pandas supports writing DataFrames to SQL databases using the `to_sql`
+            # method. We can specify the table name, the connection, and whether we want
+            # to append the data to the table or replace it.
             data.to_sql("data", connection, if_exists="append", index=False)
 
         except sqlite3.Error:
@@ -306,9 +310,183 @@ class Local(Backend):
         Deploying a model is not applicable when serving the model directly.
         """
 
+class JsonLines(Backend):
+    """JsonLines backend implementation.
 
+    A model with this backend will store production data in a JSON Lines formatted file.
+    Each line in the file is a valid JSON object representing an input request and its 
+    corresponding prediction.
+    """
+
+    def __init__(self, config: dict | None = None) -> None:
+        """Initialize backend using the supplied configuration.
+
+        If the configuration is not provided, the class will attempt to read the
+        configuration from environment variables.
+        """
+        self.target = (
+            config.get("target", "http://127.0.0.1:8080/invocations")
+            if config
+            else "http://127.0.0.1:8080/invocations"
+        )
+        
+        # File path for the JSON Lines storage
+        self.storage_file = "penguins.jsonl"
+
+        if config:
+            self.storage_file = config.get("storage_file", self.storage_file)
+        else:
+            self.storage_file = os.getenv("MODEL_BACKEND_STORAGE_FILE", self.storage_file)
+
+        # Make sure the directory exists
+        storage_dir = os.path.dirname(self.storage_file)
+        if storage_dir and not os.path.exists(storage_dir):
+            os.makedirs(storage_dir)
+
+        logging.info("Backend storage file: %s", self.storage_file)
+
+    def load(self, limit: int = 100) -> pd.DataFrame | None:
+        """Load production data from the JSON Lines file."""
+        if not Path(self.storage_file).exists():
+            logging.error("Storage file %s does not exist.", self.storage_file)
+            return None
+
+        try:
+            # Read the JSON Lines file into a DataFrame
+            data = []
+            with open(self.storage_file, "r") as f:
+                for line in f:
+                    data.append(json.loads(line))
+            
+            # Convert to DataFrame
+            df = pd.DataFrame(data)
+            
+            # If there are no records, return an empty DataFrame
+            if df.empty:
+                return df
+                
+            # Filter for records that have ground truth
+            df_with_gt = df[df["ground_truth"].notna()]
+            
+            # Return the most recent 'limit' records
+            return df_with_gt.sort_values("date", ascending=False).head(limit)
+            
+        except Exception:
+            logging.exception("Error loading data from the JSONL file.")
+            return None
+
+    def save(self, model_input: pd.DataFrame, model_output: list) -> None:
+        """Save production data to a JSON Lines file.
+
+        If the file doesn't exist, this function will create it.
+        """
+        logging.info("Storing production data in the JSONL file...")
+
+        try:
+            # Let's create a copy from the model input so we can modify the DataFrame
+            # before storing it in the file
+            data = model_input.copy()
+
+            # Current timestamp in UTC
+            current_time = datetime.now(timezone.utc).isoformat()
+            data["date"] = current_time
+
+            # Initialize columns
+            data["prediction"] = None
+            data["confidence"] = None
+            data["ground_truth"] = None
+
+            # Update with model output if available
+            if model_output is not None and len(model_output) > 0:
+                data["prediction"] = [item["prediction"] for item in model_output]
+                data["confidence"] = [item["confidence"] for item in model_output]
+
+            # Generate unique IDs
+            data["uuid"] = [str(uuid.uuid4()) for _ in range(len(data))]
+
+            # Convert DataFrame to list of dictionaries
+            records = data.to_dict(orient="records")
+
+            # Append to the JSON Lines file
+            with open(self.storage_file, "a") as f:
+                for record in records:
+                    f.write(json.dumps(record) + "\n")
+
+        except Exception:
+            logging.exception("There was an error saving production data to the JSONL file.")
+
+    def label(self, ground_truth_quality: float = 0.8) -> int:
+        """Label every unlabeled sample stored in the JSON Lines file."""
+        if not Path(self.storage_file).exists():
+            logging.error("Storage file %s does not exist.", self.storage_file)
+            return 0
+
+        try:
+            # Read the existing data
+            with open(self.storage_file, "r") as f:
+                lines = f.readlines()
+            
+            records = [json.loads(line) for line in lines]
+            
+            # Count how many records need labeling
+            unlabeled_count = 0
+            
+            # Process each record
+            for i, record in enumerate(records):
+                if record.get("ground_truth") is None and record.get("prediction") is not None:
+                    # Generate fake label
+                    label = self.get_fake_label(record["prediction"], ground_truth_quality)
+                    record["ground_truth"] = label
+                    records[i] = record
+                    unlabeled_count += 1
+            
+            # Write back all records if we labeled anything
+            if unlabeled_count > 0:
+                with open(self.storage_file, "w") as f:
+                    for record in records:
+                        f.write(json.dumps(record) + "\n")
+            
+            logging.info("Labeled %s samples.", unlabeled_count)
+            return unlabeled_count
+            
+        except Exception:
+            logging.exception("There was an error labeling production data")
+            return 0
+
+    def invoke(self, payload: list | dict) -> dict | None:
+        """Make a prediction request to the hosted model."""
+        import requests
+
+        logging.info('Running prediction on "%s"...', self.target)
+
+        try:
+            predictions = requests.post(
+                url=self.target,
+                headers={"Content-Type": "application/json"},
+                data=json.dumps(
+                    {
+                        "inputs": payload,
+                    },
+                ),
+                timeout=5,
+            )
+            return predictions.json()
+        except Exception:
+            logging.exception("There was an error sending traffic to the endpoint.")
+            return None
+
+    def deploy(self, model_uri: str, model_version: str) -> None:
+        """Not Implemented.
+
+        Deploying a model is not applicable when serving the model directly.
+        """
+        logging.info(
+            "Deploy not implemented for JsonLines backend. "
+            "Use 'mlflow models serve' to serve the model."
+        )
+        
 class Sagemaker(Backend):
-    """Sagemake backend implementation.
+    """Sagemaker backend implementation.
 
     A model with this backend will be deployed to Sagemaker and will use S3
     to store production data.
